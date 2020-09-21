@@ -54,17 +54,18 @@ export function usePaginatedQuery<TResult = unknown, TError = unknown>(
 
 // Implementation
 export function usePaginatedQuery<TResult, TError>(
-  ...args: any[]
+  arg1: any,
+  arg2?: any,
+  arg3?: any
 ): PaginatedQueryResult<TResult, TError> {
-  const config = getQueryArgs<TResult, TError>(args)[1]
-  const result = useBaseQuery<TResult, TError>({
-    ...config,
+  const [queryKey, config] = getQueryArgs<TResult, TError>(arg1, arg2, arg3)
+  const result = useBaseQuery(queryKey, {
     keepPreviousData: true,
+    ...config,
   })
   return {
     ...result,
     resolvedData: result.data,
-    latestData:
-      result.query.state.data === result.data ? result.data : undefined,
+    latestData: result.isPreviousData ? undefined : result.data,
   }
 }

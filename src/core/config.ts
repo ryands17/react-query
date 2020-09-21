@@ -1,12 +1,14 @@
 import { stableStringify } from './utils'
-import {
+import type {
   ArrayQueryKey,
+  MutationConfig,
+  QueryConfig,
   QueryKey,
   QueryKeySerializerFunction,
   ReactQueryConfig,
-  QueryConfig,
-  MutationConfig,
+  ResolvedQueryConfig,
 } from './types'
+import type { QueryCache } from './queryCache'
 
 // TYPES
 
@@ -49,17 +51,26 @@ export const defaultQueryKeySerializerFn: QueryKeySerializerFunction = (
  */
 export const DEFAULT_CONFIG: ReactQueryConfig = {
   queries: {
-    queryKeySerializerFn: defaultQueryKeySerializerFn,
+    cacheTime: 5 * 60 * 1000,
     enabled: true,
+    notifyOnStatusChange: true,
+    queryFn: () => Promise.reject(),
+    queryKeySerializerFn: defaultQueryKeySerializerFn,
+    refetchOnMount: true,
+    refetchOnReconnect: true,
+    refetchOnWindowFocus: true,
     retry: 3,
     retryDelay: attemptIndex => Math.min(1000 * 2 ** attemptIndex, 30000),
     staleTime: 0,
-    cacheTime: 5 * 60 * 1000,
-    refetchOnWindowFocus: true,
-    refetchOnReconnect: true,
-    refetchOnMount: true,
     structuralSharing: true,
   },
+}
+
+export function getDefaultReactQueryConfig() {
+  return {
+    queries: { ...DEFAULT_CONFIG.queries },
+    mutations: { ...DEFAULT_CONFIG.mutations },
+  }
 }
 
 export function mergeReactQueryConfigs(
@@ -82,43 +93,55 @@ export function mergeReactQueryConfigs(
   }
 }
 
-export function getDefaultedQueryConfig<TResult, TError>(
-  queryCacheConfig?: ReactQueryConfig,
+export function getResolvedQueryConfig<TResult, TError>(
+  queryCache: QueryCache,
+  queryKey: QueryKey,
   contextConfig?: ReactQueryConfig,
-  config?: QueryConfig<TResult, TError>,
-  configOverrides?: QueryConfig<TResult, TError>
-): QueryConfig<TResult, TError> {
-  return {
-    ...DEFAULT_CONFIG.shared,
+  config?: QueryConfig<TResult, TError>
+): ResolvedQueryConfig<TResult, TError> {
+  const queryCacheConfig = queryCache.getDefaultConfig()
+
+  const resolvedConfig = {
     ...DEFAULT_CONFIG.queries,
     ...queryCacheConfig?.shared,
     ...queryCacheConfig?.queries,
     ...contextConfig?.shared,
     ...contextConfig?.queries,
     ...config,
-    ...configOverrides,
-  } as QueryConfig<TResult, TError>
+  } as ResolvedQueryConfig<TResult, TError>
+
+  const result = resolvedConfig.queryKeySerializerFn(queryKey)
+
+  resolvedConfig.queryCache = queryCache
+  resolvedConfig.queryHash = result[0]
+  resolvedConfig.queryKey = result[1]
+
+  return resolvedConfig
 }
 
-export function getDefaultedMutationConfig<
+export function isResolvedQueryConfig<TResult, TError>(
+  config: any
+): config is ResolvedQueryConfig<TResult, TError> {
+  return Boolean(config.queryHash)
+}
+
+export function getResolvedMutationConfig<
   TResult,
   TError,
   TVariables,
   TSnapshot
 >(
-  queryCacheConfig?: ReactQueryConfig,
+  queryCache: QueryCache,
   contextConfig?: ReactQueryConfig,
-  config?: MutationConfig<TResult, TError, TVariables, TSnapshot>,
-  configOverrides?: MutationConfig<TResult, TError, TVariables, TSnapshot>
+  config?: MutationConfig<TResult, TError, TVariables, TSnapshot>
 ): MutationConfig<TResult, TError, TVariables, TSnapshot> {
+  const queryCacheConfig = queryCache.getDefaultConfig()
   return {
-    ...DEFAULT_CONFIG.shared,
     ...DEFAULT_CONFIG.mutations,
     ...queryCacheConfig?.shared,
     ...queryCacheConfig?.mutations,
     ...contextConfig?.shared,
     ...contextConfig?.mutations,
     ...config,
-    ...configOverrides,
   } as MutationConfig<TResult, TError, TVariables, TSnapshot>
 }

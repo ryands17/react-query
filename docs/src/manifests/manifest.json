@@ -42,11 +42,21 @@
               "title": "TypeScript",
               "path": "/docs/typescript",
               "editUrl": "/docs/typescript.md"
+            },
+            {
+              "title": "GraphQL",
+              "path": "/docs/graphql",
+              "editUrl": "/docs/graphql.md"
+            },
+            {
+              "title": "React Native",
+              "path": "/docs/react-native",
+              "editUrl": "/docs/react-native.md"
             }
           ]
         },
         {
-          "title": "Concepts",
+          "title": "Guides & Concepts",
           "open": true,
           "routes": [
             {
@@ -152,6 +162,12 @@
           ]
         },
         {
+          "title": "API Reference",
+          "heading": true,
+          "path": "/docs/api",
+          "editUrl": "/docs/api.md"
+        },
+        {
           "title": "Examples",
           "open": true,
           "routes": [
@@ -164,6 +180,11 @@
               "title": "Basic",
               "path": "/docs/examples/basic",
               "editUrl": "/docs/examples/basic.mdx"
+            },
+            {
+              "title": "Basic w/ GraphQL-Request",
+              "path": "/docs/examples/basic-graphql-request",
+              "editUrl": "/docs/examples/basic-graphql-request.mdx"
             },
             {
               "title": "Custom Hooks",
@@ -228,12 +249,6 @@
           ]
         }
       ]
-    },
-    {
-      "title": "API Reference",
-      "heading": true,
-      "path": "/docs/api",
-      "editUrl": "/docs/api.md"
     }
   ]
 }

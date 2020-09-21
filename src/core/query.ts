@@ -3,12 +3,13 @@ import {
   Console,
   Updater,
   functionalUpdate,
-  getStatusProps,
   isCancelable,
   isCancelledError,
   isDocumentVisible,
   isOnline,
   isServer,
+  isValidTimeout,
+  noop,
   replaceEqualDeep,
   sleep,
 } from './utils'
@@ -16,38 +17,28 @@ import {
   ArrayQueryKey,
   InitialDataFunction,
   IsFetchingMoreValue,
-  QueryConfig,
   QueryFunction,
   QueryStatus,
+  ResolvedQueryConfig,
 } from './types'
 import type { QueryCache } from './queryCache'
 import { QueryObserver, UpdateListener } from './queryObserver'
+import { notifyManager } from './notifyManager'
 
 // TYPES
-
-interface QueryInitConfig<TResult, TError> {
-  queryCache: QueryCache
-  queryKey: ArrayQueryKey
-  queryHash: string
-  config: QueryConfig<TResult, TError>
-  notifyGlobalListeners: (query: Query<TResult, TError>) => void
-}
 
 export interface QueryState<TResult, TError> {
   canFetchMore?: boolean
   data?: TResult
   error: TError | null
   failureCount: number
-  isError: boolean
-  isFetched: boolean
   isFetching: boolean
   isFetchingMore: IsFetchingMoreValue
-  isIdle: boolean
-  isLoading: boolean
-  isStale: boolean
-  isSuccess: boolean
+  isInitialData: boolean
+  isInvalidated: boolean
   status: QueryStatus
   throwInErrorBoundary?: boolean
+  updateCount: number
   updatedAt: number
 }
 
@@ -64,20 +55,20 @@ export interface RefetchOptions {
   throwOnError?: boolean
 }
 
-export enum ActionType {
-  Failed = 'Failed',
-  MarkStale = 'MarkStale',
-  Fetch = 'Fetch',
-  Success = 'Success',
-  Error = 'Error',
+const enum ActionType {
+  Failed,
+  Fetch,
+  Success,
+  Error,
+  Invalidate,
+}
+
+interface SetDataOptions {
+  updatedAt?: number
 }
 
 interface FailedAction {
   type: ActionType.Failed
-}
-
-interface MarkStaleAction {
-  type: ActionType.MarkStale
 }
 
 interface FetchAction {
@@ -89,7 +80,7 @@ interface SuccessAction<TResult> {
   type: ActionType.Success
   data: TResult | undefined
   canFetchMore?: boolean
-  isStale: boolean
+  updatedAt?: number
 }
 
 interface ErrorAction<TError> {
@@ -97,11 +88,15 @@ interface ErrorAction<TError> {
   error: TError
 }
 
+interface InvalidateAction {
+  type: ActionType.Invalidate
+}
+
 export type Action<TResult, TError> =
   | ErrorAction<TError>
   | FailedAction
   | FetchAction
-  | MarkStaleAction
+  | InvalidateAction
   | SuccessAction<TResult>
 
 // CLASS
@@ -109,119 +104,71 @@ export type Action<TResult, TError> =
 export class Query<TResult, TError> {
   queryKey: ArrayQueryKey
   queryHash: string
-  config: QueryConfig<TResult, TError>
+  config: ResolvedQueryConfig<TResult, TError>
   observers: QueryObserver<TResult, TError>[]
   state: QueryState<TResult, TError>
+  cacheTime: number
 
   private queryCache: QueryCache
-  private promise?: Promise<TResult | undefined>
-  private cacheTimeout?: number
-  private staleTimeout?: number
-  private cancelFetch?: () => void
+  private promise?: Promise<TResult>
+  private gcTimeout?: number
+  private cancelFetch?: (silent?: boolean) => void
   private continueFetch?: () => void
   private isTransportCancelable?: boolean
-  private notifyGlobalListeners: (query: Query<TResult, TError>) => void
-  private enableTimeouts: boolean
 
-  constructor(init: QueryInitConfig<TResult, TError>) {
-    this.config = init.config
-    this.queryCache = init.queryCache
-    this.queryKey = init.queryKey
-    this.queryHash = init.queryHash
-    this.notifyGlobalListeners = init.notifyGlobalListeners
-    this.observers = []
-    this.state = getDefaultState(init.config)
-    this.enableTimeouts = false
-  }
-
-  activateTimeouts(): void {
-    this.enableTimeouts = true
-    this.rescheduleStaleTimeout()
-    this.rescheduleGarbageCollection()
-  }
-
-  updateConfig(config: QueryConfig<TResult, TError>): void {
+  constructor(config: ResolvedQueryConfig<TResult, TError>) {
     this.config = config
+    this.queryKey = config.queryKey
+    this.queryHash = config.queryHash
+    this.queryCache = config.queryCache
+    this.cacheTime = config.cacheTime
+    this.observers = []
+    this.state = getDefaultState(config)
+    this.scheduleGc()
+  }
+
+  private updateConfig(config: ResolvedQueryConfig<TResult, TError>): void {
+    this.config = config
+    this.cacheTime = Math.max(this.cacheTime, config.cacheTime)
   }
 
   private dispatch(action: Action<TResult, TError>): void {
     this.state = queryReducer(this.state, action)
-    this.observers.forEach(d => d.onQueryUpdate(this.state, action))
-    this.notifyGlobalListeners(this)
+
+    notifyManager.batch(() => {
+      this.observers.forEach(observer => {
+        observer.onQueryUpdate(action)
+      })
+
+      this.queryCache.notifyGlobalListeners(this)
+    })
   }
 
-  private rescheduleStaleTimeout(): void {
+  private scheduleGc(): void {
     if (isServer) {
       return
     }
 
-    this.clearStaleTimeout()
+    this.clearGcTimeout()
 
-    if (
-      !this.enableTimeouts ||
-      this.state.isStale ||
-      this.state.status !== QueryStatus.Success ||
-      this.config.staleTime === Infinity
-    ) {
+    if (this.observers.length > 0 || !isValidTimeout(this.cacheTime)) {
       return
     }
 
-    const staleTime = this.config.staleTime || 0
-    let timeout = staleTime
-    if (this.state.updatedAt) {
-      const timeElapsed = Date.now() - this.state.updatedAt
-      const timeUntilStale = staleTime - timeElapsed
-      timeout = Math.max(timeUntilStale, 0)
-    }
-
-    this.staleTimeout = setTimeout(() => {
-      this.invalidate()
-    }, timeout)
+    this.gcTimeout = setTimeout(() => {
+      this.remove()
+    }, this.cacheTime)
   }
 
-  invalidate(): void {
-    this.clearStaleTimeout()
+  cancel(silent?: boolean): Promise<undefined> {
+    const promise = this.promise
 
-    if (this.state.isStale) {
-      return
+    if (promise && this.cancelFetch) {
+      this.cancelFetch(silent)
+      return promise.then(noop).catch(noop)
     }
 
-    this.dispatch({ type: ActionType.MarkStale })
-  }
-
-  private rescheduleGarbageCollection(): void {
-    if (isServer) {
-      return
-    }
-
-    this.clearCacheTimeout()
-
-    if (
-      !this.enableTimeouts ||
-      this.config.cacheTime === Infinity ||
-      this.observers.length > 0
-    ) {
-      return
-    }
-
-    this.cacheTimeout = setTimeout(() => {
-      this.clear()
-    }, this.config.cacheTime)
-  }
-
-  async refetch(options?: RefetchOptions): Promise<TResult | undefined> {
-    try {
-      return await this.fetch()
-    } catch (error) {
-      if (options?.throwOnError === true) {
-        throw error
-      }
-      return undefined
-    }
-  }
-
-  cancel(): void {
-    this.cancelFetch?.()
+    return Promise.resolve(undefined)
   }
 
   private continue(): void {
@@ -230,25 +177,21 @@ export class Query<TResult, TError> {
 
   private clearTimersObservers(): void {
     this.observers.forEach(observer => {
-      observer.clearRefetchInterval()
+      observer.clearTimers()
     })
   }
 
-  private clearStaleTimeout() {
-    if (this.staleTimeout) {
-      clearTimeout(this.staleTimeout)
-      this.staleTimeout = undefined
+  private clearGcTimeout() {
+    if (this.gcTimeout) {
+      clearTimeout(this.gcTimeout)
+      this.gcTimeout = undefined
     }
   }
 
-  private clearCacheTimeout() {
-    if (this.cacheTimeout) {
-      clearTimeout(this.cacheTimeout)
-      this.cacheTimeout = undefined
-    }
-  }
-
-  setData(updater: Updater<TResult | undefined, TResult>): void {
+  setData(
+    updater: Updater<TResult | undefined, TResult>,
+    options?: SetDataOptions
+  ): void {
     const prevData = this.state.data
 
     // Get the new data
@@ -264,8 +207,6 @@ export class Query<TResult, TError> {
       data = prevData
     }
 
-    const isStale = this.config.staleTime === 0
-
     // Try to determine if more data can be fetched
     const canFetchMore = hasMorePages(this.config, data)
 
@@ -273,63 +214,84 @@ export class Query<TResult, TError> {
     this.dispatch({
       type: ActionType.Success,
       data,
-      isStale,
       canFetchMore,
+      updatedAt: options?.updatedAt,
     })
-
-    this.rescheduleStaleTimeout()
   }
 
+  /**
+   * @deprecated
+   */
   clear(): void {
-    this.clearStaleTimeout()
-    this.clearCacheTimeout()
+    Console.warn(
+      'react-query: clear() has been deprecated, please use remove() instead'
+    )
+    this.remove()
+  }
+
+  remove(): void {
+    this.queryCache.removeQuery(this)
+  }
+
+  destroy(): void {
+    this.clearGcTimeout()
     this.clearTimersObservers()
     this.cancel()
-    delete this.queryCache.queries[this.queryHash]
-    this.notifyGlobalListeners(this)
   }
 
-  isEnabled(): boolean {
+  isActive(): boolean {
     return this.observers.some(observer => observer.config.enabled)
   }
 
-  onWindowFocus(): void {
-    if (
-      this.state.isStale &&
-      this.observers.some(
-        observer =>
-          observer.config.enabled && observer.config.refetchOnWindowFocus
+  isStale(): boolean {
+    return (
+      this.state.isInvalidated ||
+      this.state.status !== QueryStatus.Success ||
+      this.observers.some(observer => observer.getCurrentResult().isStale)
+    )
+  }
+
+  isStaleByTime(staleTime = 0): boolean {
+    return (
+      this.state.isInvalidated ||
+      this.state.status !== QueryStatus.Success ||
+      this.state.updatedAt + staleTime <= Date.now()
+    )
+  }
+
+  onInteraction(type: 'focus' | 'online'): void {
+    // Execute the first observer which is enabled,
+    // stale and wants to refetch on this interaction.
+    const staleObserver = this.observers.find(observer => {
+      const { config } = observer
+      const { isStale } = observer.getCurrentResult()
+      return (
+        config.enabled &&
+        ((type === 'focus' &&
+          (config.refetchOnWindowFocus === 'always' ||
+            (config.refetchOnWindowFocus && isStale))) ||
+          (type === 'online' &&
+            (config.refetchOnReconnect === 'always' ||
+              (config.refetchOnReconnect && isStale))))
       )
-    ) {
-      this.fetch()
+    })
+
+    if (staleObserver) {
+      staleObserver.fetch()
     }
+
+    // Continue any paused fetch
     this.continue()
   }
 
-  onOnline(): void {
-    if (
-      this.state.isStale &&
-      this.observers.some(
-        observer =>
-          observer.config.enabled && observer.config.refetchOnReconnect
-      )
-    ) {
-      this.fetch()
-    }
-    this.continue()
-  }
-
+  /**
+   * @deprectated
+   */
   subscribe(
     listener?: UpdateListener<TResult, TError>
   ): QueryObserver<TResult, TError> {
-    const observer = new QueryObserver<TResult, TError>({
-      queryCache: this.queryCache,
-      queryKey: this.queryKey,
-      ...this.config,
-    })
-
+    const observer = new QueryObserver(this.config)
     observer.subscribe(listener)
-
     return observer
   }
 
@@ -337,7 +299,7 @@ export class Query<TResult, TError> {
     this.observers.push(observer)
 
     // Stop the query from being garbage collected
-    this.clearCacheTimeout()
+    this.clearGcTimeout()
   }
 
   unsubscribeObserver(observer: QueryObserver<TResult, TError>): void {
@@ -349,13 +311,197 @@ export class Query<TResult, TError> {
       if (this.isTransportCancelable) {
         this.cancel()
       }
-    }
 
-    this.rescheduleGarbageCollection()
+      this.scheduleGc()
+    }
   }
 
-  private async tryFetchData<T>(
-    config: QueryConfig<TResult, TError>,
+  invalidate(): void {
+    if (!this.state.isInvalidated) {
+      this.dispatch({ type: ActionType.Invalidate })
+    }
+  }
+
+  /**
+   * @deprectated
+   */
+  refetch(
+    options?: RefetchOptions,
+    config?: ResolvedQueryConfig<TResult, TError>
+  ): Promise<TResult | undefined> {
+    let promise: Promise<TResult | undefined> = this.fetch(undefined, config)
+
+    if (!options?.throwOnError) {
+      promise = promise.catch(noop)
+    }
+
+    return promise
+  }
+
+  /**
+   * @deprectated
+   */
+  fetchMore(
+    fetchMoreVariable?: unknown,
+    options?: FetchMoreOptions,
+    config?: ResolvedQueryConfig<TResult, TError>
+  ): Promise<TResult | undefined> {
+    return this.fetch(
+      {
+        fetchMore: {
+          fetchMoreVariable,
+          previous: options?.previous || false,
+        },
+      },
+      config
+    )
+  }
+
+  async fetch(
+    options?: FetchOptions,
+    config?: ResolvedQueryConfig<TResult, TError>
+  ): Promise<TResult> {
+    if (this.promise) {
+      if (options?.fetchMore && this.state.data) {
+        // Silently cancel current fetch if the user wants to fetch more
+        await this.cancel(true)
+      } else {
+        // Return current promise if we are already fetching
+        return this.promise
+      }
+    }
+
+    // Update config if passed, otherwise the config from the last execution is used
+    if (config) {
+      this.updateConfig(config)
+    }
+
+    config = this.config
+
+    // Get the query function params
+    const filter = config.queryFnParamsFilter
+    const params = filter ? filter(this.queryKey) : this.queryKey
+
+    this.promise = (async () => {
+      try {
+        let data: any
+
+        if (config.infinite) {
+          data = await this.startInfiniteFetch(config, params, options)
+        } else {
+          data = await this.startFetch(config, params, options)
+        }
+
+        // Set success state
+        this.setData(data)
+
+        // Cleanup
+        delete this.promise
+
+        // Return data
+        return data
+      } catch (error) {
+        // Set error state if needed
+        if (!(isCancelledError(error) && error.silent)) {
+          this.dispatch({
+            type: ActionType.Error,
+            error,
+          })
+        }
+
+        // Log error
+        if (!isCancelledError(error)) {
+          Console.error(error)
+        }
+
+        // Cleanup
+        delete this.promise
+
+        // Propagate error
+        throw error
+      }
+    })()
+
+    return this.promise
+  }
+
+  private startFetch(
+    config: ResolvedQueryConfig<TResult, TError>,
+    params: unknown[],
+    _options?: FetchOptions
+  ): Promise<TResult> {
+    // Create function to fetch the data
+    const fetchData = () => config.queryFn(...params)
+
+    // Set to fetching state if not already in it
+    if (!this.state.isFetching) {
+      this.dispatch({ type: ActionType.Fetch })
+    }
+
+    // Try to fetch the data
+    return this.tryFetchData(config, fetchData)
+  }
+
+  private startInfiniteFetch(
+    config: ResolvedQueryConfig<TResult, TError>,
+    params: unknown[],
+    options?: FetchOptions
+  ): Promise<TResult[]> {
+    const fetchMore = options?.fetchMore
+    const { previous, fetchMoreVariable } = fetchMore || {}
+    const isFetchingMore = fetchMore ? (previous ? 'previous' : 'next') : false
+    const prevPages: TResult[] = (this.state.data as any) || []
+
+    // Create function to fetch a page
+    const fetchPage = async (
+      pages: TResult[],
+      prepend?: boolean,
+      cursor?: unknown
+    ) => {
+      const lastPage = getLastPage(pages, prepend)
+
+      if (
+        typeof cursor === 'undefined' &&
+        typeof lastPage !== 'undefined' &&
+        config.getFetchMore
+      ) {
+        cursor = config.getFetchMore(lastPage, pages)
+      }
+
+      const page = await config.queryFn(...params, cursor)
+
+      return prepend ? [page, ...pages] : [...pages, page]
+    }
+
+    // Create function to fetch the data
+    const fetchData = () => {
+      if (isFetchingMore) {
+        return fetchPage(prevPages, previous, fetchMoreVariable)
+      } else if (!prevPages.length) {
+        return fetchPage([])
+      } else {
+        let promise = fetchPage([])
+        for (let i = 1; i < prevPages.length; i++) {
+          promise = promise.then(fetchPage)
+        }
+        return promise
+      }
+    }
+
+    // Set to fetching state if not already in it
+    if (
+      !this.state.isFetching ||
+      this.state.isFetchingMore !== isFetchingMore
+    ) {
+      this.dispatch({ type: ActionType.Fetch, isFetchingMore })
+    }
+
+    // Try to get the data
+    return this.tryFetchData(config, fetchData)
+  }
+
+  private tryFetchData<T>(
+    config: ResolvedQueryConfig<TResult, TError>,
     fn: QueryFunction<T>
   ): Promise<T> {
     return new Promise<T>((outerResolve, outerReject) => {
@@ -385,11 +531,9 @@ export class Query<TResult, TError> {
       }
 
       // Create callback to cancel this fetch
-      this.cancelFetch = () => {
-        reject(new CancelledError())
-        try {
-          cancelTransport?.()
-        } catch {}
+      this.cancelFetch = silent => {
+        reject(new CancelledError(silent))
+        cancelTransport?.()
       }
 
       // Create callback to continue this fetch
@@ -406,7 +550,9 @@ export class Query<TResult, TError> {
           // Check if the transport layer support cancellation
           if (isCancelable(promiseOrValue)) {
             cancelTransport = () => {
-              promiseOrValue.cancel()
+              try {
+                promiseOrValue.cancel()
+              } catch {}
             }
             this.isTransportCancelable = true
           }
@@ -458,149 +604,6 @@ export class Query<TResult, TError> {
       run()
     })
   }
-
-  async fetch(options?: FetchOptions): Promise<TResult | undefined> {
-    // If we are already fetching, return current promise
-    if (this.promise) {
-      return this.promise
-    }
-
-    // Store reference to the config that initiated this fetch
-    const config = this.config
-
-    // Check if there is a query function
-    if (!config.queryFn) {
-      return
-    }
-
-    // Get the query function params
-    const filter = config.queryFnParamsFilter
-    const params = filter ? filter(this.queryKey) : this.queryKey
-
-    this.promise = (async () => {
-      try {
-        let data: any
-
-        if (config.infinite) {
-          data = await this.startInfiniteFetch(config, params, options)
-        } else {
-          data = await this.startFetch(config, params, options)
-        }
-
-        // Set success state
-        this.setData(data)
-
-        // Cleanup
-        delete this.promise
-
-        // Return data
-        return data
-      } catch (error) {
-        // Set error state
-        this.dispatch({
-          type: ActionType.Error,
-          error,
-        })
-
-        // Log error
-        if (!isCancelledError(error)) {
-          Console.error(error)
-        }
-
-        // Cleanup
-        delete this.promise
-
-        // Propagate error
-        throw error
-      }
-    })()
-
-    return this.promise
-  }
-
-  private async startFetch(
-    config: QueryConfig<TResult, TError>,
-    params: unknown[],
-    _options?: FetchOptions
-  ): Promise<TResult> {
-    // Create function to fetch the data
-    const fetchData = () => config.queryFn!(...params)
-
-    // Set to fetching state if not already in it
-    if (!this.state.isFetching) {
-      this.dispatch({ type: ActionType.Fetch })
-    }
-
-    // Try to fetch the data
-    return this.tryFetchData(config, fetchData)
-  }
-
-  private async startInfiniteFetch(
-    config: QueryConfig<TResult, TError>,
-    params: unknown[],
-    options?: FetchOptions
-  ): Promise<TResult[]> {
-    const fetchMore = options?.fetchMore
-    const { previous, fetchMoreVariable } = fetchMore || {}
-    const isFetchingMore = fetchMore ? (previous ? 'previous' : 'next') : false
-    const prevPages: TResult[] = (this.state.data as any) || []
-
-    // Create function to fetch a page
-    const fetchPage = async (
-      pages: TResult[],
-      prepend?: boolean,
-      cursor?: unknown
-    ) => {
-      const lastPage = getLastPage(pages, prepend)
-
-      if (
-        typeof cursor === 'undefined' &&
-        typeof lastPage !== 'undefined' &&
-        config.getFetchMore
-      ) {
-        cursor = config.getFetchMore(lastPage, pages)
-      }
-
-      const page = await config.queryFn!(...params, cursor)
-
-      return prepend ? [page, ...pages] : [...pages, page]
-    }
-
-    // Create function to fetch the data
-    const fetchData = () => {
-      if (isFetchingMore) {
-        return fetchPage(prevPages, previous, fetchMoreVariable)
-      } else if (!prevPages.length) {
-        return fetchPage([])
-      } else {
-        let promise = fetchPage([])
-        for (let i = 1; i < prevPages.length; i++) {
-          promise = promise.then(fetchPage)
-        }
-        return promise
-      }
-    }
-
-    // Set to fetching state if not already in it
-    if (!this.state.isFetching) {
-      this.dispatch({ type: ActionType.Fetch, isFetchingMore })
-    }
-
-    // Try to get the data
-    return this.tryFetchData(config, fetchData)
-  }
-
-  fetchMore(
-    fetchMoreVariable?: unknown,
-    options?: FetchMoreOptions
-  ): Promise<TResult | undefined> {
-    return this.fetch({
-      fetchMore: {
-        fetchMoreVariable,
-        previous: options?.previous || false,
-      },
-    })
-  }
 }
 
 function getLastPage<TResult>(pages: TResult[], previous?: boolean): TResult {
@@ -608,49 +611,42 @@ function getLastPage<TResult>(pages: TResult[], previous?: boolean): TResult {
 }
 
 function hasMorePages<TResult, TError>(
-  config: QueryConfig<TResult, TError>,
+  config: ResolvedQueryConfig<TResult, TError>,
   pages: unknown,
   previous?: boolean
 ): boolean | undefined {
   if (config.infinite && config.getFetchMore && Array.isArray(pages)) {
     return Boolean(config.getFetchMore(getLastPage(pages, previous), pages))
   }
-  return undefined
 }
 
 function getDefaultState<TResult, TError>(
-  config: QueryConfig<TResult, TError>
+  config: ResolvedQueryConfig<TResult, TError>
 ): QueryState<TResult, TError> {
-  const initialData =
+  const data =
     typeof config.initialData === 'function'
       ? (config.initialData as InitialDataFunction<TResult>)()
       : config.initialData
 
-  const hasInitialData = typeof initialData !== 'undefined'
-
-  const isStale =
-    !config.enabled ||
-    (typeof config.initialStale === 'function'
-      ? config.initialStale()
-      : config.initialStale ?? !hasInitialData)
-
-  const initialStatus = hasInitialData
-    ? QueryStatus.Success
-    : config.enabled
-    ? QueryStatus.Loading
-    : QueryStatus.Idle
+  const status =
+    typeof data !== 'undefined'
+      ? QueryStatus.Success
+      : config.enabled
+      ? QueryStatus.Loading
+      : QueryStatus.Idle
 
   return {
-    ...getStatusProps(initialStatus),
+    canFetchMore: hasMorePages(config, data),
+    data,
     error: null,
-    isFetched: false,
-    isFetching: initialStatus === QueryStatus.Loading,
-    isFetchingMore: false,
     failureCount: 0,
-    isStale,
-    data: initialData,
-    updatedAt: hasInitialData ? Date.now() : 0,
-    canFetchMore: hasMorePages(config, initialData),
+    isFetching: status === QueryStatus.Loading,
+    isFetchingMore: false,
+    isInitialData: true,
+    isInvalidated: false,
+    status,
+    updateCount: 0,
+    updatedAt: Date.now(),
   }
 }
 
@@ -664,48 +660,47 @@ export function queryReducer<TResult, TError>(
         ...state,
         failureCount: state.failureCount + 1,
       }
-    case ActionType.MarkStale:
-      return {
-        ...state,
-        isStale: true,
-      }
     case ActionType.Fetch:
-      const status =
-        typeof state.data !== 'undefined'
-          ? QueryStatus.Success
-          : QueryStatus.Loading
       return {
         ...state,
-        ...getStatusProps(status),
+        failureCount: 0,
         isFetching: true,
         isFetchingMore: action.isFetchingMore || false,
-        failureCount: 0,
+        status:
+          typeof state.data !== 'undefined'
+            ? QueryStatus.Success
+            : QueryStatus.Loading,
       }
     case ActionType.Success:
       return {
         ...state,
-        ...getStatusProps(QueryStatus.Success),
+        canFetchMore: action.canFetchMore,
         data: action.data,
         error: null,
-        isStale: action.isStale,
-        isFetched: true,
+        failureCount: 0,
         isFetching: false,
         isFetchingMore: false,
-        canFetchMore: action.canFetchMore,
-        updatedAt: Date.now(),
-        failureCount: 0,
+        isInitialData: false,
+        isInvalidated: false,
+        status: QueryStatus.Success,
+        updateCount: state.updateCount + 1,
+        updatedAt: action.updatedAt ?? Date.now(),
       }
     case ActionType.Error:
       return {
         ...state,
-        ...getStatusProps(QueryStatus.Error),
         error: action.error,
-        isFetched: true,
+        failureCount: state.failureCount + 1,
         isFetching: false,
         isFetchingMore: false,
-        isStale: true,
-        failureCount: state.failureCount + 1,
+        status: QueryStatus.Error,
         throwInErrorBoundary: true,
+        updateCount: state.updateCount + 1,
+      }
+    case ActionType.Invalidate:
+      return {
+        ...state,
+        isInvalidated: true,
       }
     default:
       return state

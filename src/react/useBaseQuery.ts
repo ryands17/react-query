@@ -1,47 +1,72 @@
 import React from 'react'
 
-import { useRerenderer } from './utils'
+import { useIsMounted } from './utils'
+import { getResolvedQueryConfig } from '../core/config'
 import { QueryObserver } from '../core/queryObserver'
-import { QueryResultBase, QueryObserverConfig } from '../core/types'
-import { useDefaultedQueryConfig } from './useDefaultedQueryConfig'
+import { QueryResultBase, QueryKey, QueryConfig } from '../core/types'
+import { useErrorResetBoundary } from './ReactQueryErrorResetBoundary'
+import { useQueryCache } from './ReactQueryCacheProvider'
+import { useContextConfig } from './ReactQueryConfigProvider'
 
 export function useBaseQuery<TResult, TError>(
-  config: QueryObserverConfig<TResult, TError> = {}
+  queryKey: QueryKey,
+  config?: QueryConfig<TResult, TError>
 ): QueryResultBase<TResult, TError> {
-  config = useDefaultedQueryConfig(config)
+  const [, rerender] = React.useReducer(c => c + 1, 0)
+  const isMounted = useIsMounted()
+  const cache = useQueryCache()
+  const contextConfig = useContextConfig()
+  const errorResetBoundary = useErrorResetBoundary()
 
-  // Make a rerender function
-  const rerender = useRerenderer()
+  // Get resolved config
+  const resolvedConfig = getResolvedQueryConfig(
+    cache,
+    queryKey,
+    contextConfig,
+    config
+  )
 
   // Create query observer
   const observerRef = React.useRef<QueryObserver<TResult, TError>>()
   const firstRender = !observerRef.current
-  const observer = observerRef.current || new QueryObserver(config)
+  const observer = observerRef.current || new QueryObserver(resolvedConfig)
   observerRef.current = observer
 
   // Subscribe to the observer
-  React.useEffect(
-    () =>
-      observer.subscribe(() => {
+  React.useEffect(() => {
+    errorResetBoundary.clearReset()
+    return observer.subscribe(() => {
+      if (isMounted()) {
         rerender()
-      }),
-    [observer, rerender]
-  )
+      }
+    })
+  }, [isMounted, observer, rerender, errorResetBoundary])
 
   // Update config
   if (!firstRender) {
-    observer.updateConfig(config)
+    observer.updateConfig(resolvedConfig)
   }
 
   const result = observer.getCurrentResult()
 
   // Handle suspense
-  if (config.suspense || config.useErrorBoundary) {
-    if (result.isError && result.query.state.throwInErrorBoundary) {
+  if (resolvedConfig.suspense || resolvedConfig.useErrorBoundary) {
+    const query = observer.getCurrentQuery()
+
+    if (
+      result.isError &&
+      !errorResetBoundary.isReset() &&
+      query.state.throwInErrorBoundary
+    ) {
       throw result.error
     }
 
-    if (config.enabled && config.suspense && !result.isSuccess) {
+    if (
+      resolvedConfig.enabled &&
+      resolvedConfig.suspense &&
+      !result.isSuccess
+    ) {
+      errorResetBoundary.clearReset()
       const unsubscribe = observer.subscribe()
       throw observer.fetch().finally(unsubscribe)
     }

@@ -1,9 +1,8 @@
 import { render, waitFor, fireEvent } from '@testing-library/react'
 import * as React from 'react'
 
-import { sleep, queryKey } from './utils'
-import { useInfiniteQuery, useQueryCache } from '..'
-import { InfiniteQueryResult } from '../../core'
+import { sleep, queryKey, waitForMs, mockConsoleError } from './utils'
+import { useInfiniteQuery, useQueryCache, InfiniteQueryResult } from '../..'
 
 interface Result {
   items: number[]
@@ -60,7 +59,7 @@ describe('useInfiniteQuery', () => {
     await waitFor(() => rendered.getByText('Status: success'))
 
     expect(states[0]).toEqual({
-      canFetchmore: undefined,
+      canFetchMore: undefined,
       clear: expect.any(Function),
       data: undefined,
       error: null,
@@ -68,14 +67,17 @@ describe('useInfiniteQuery', () => {
       fetchMore: expect.any(Function),
       isError: false,
       isFetched: false,
+      isFetchedAfterMount: false,
       isFetching: true,
       isFetchingMore: false,
       isIdle: false,
+      isInitialData: true,
       isLoading: true,
+      isPreviousData: false,
       isStale: true,
       isSuccess: false,
-      query: expect.any(Object),
       refetch: expect.any(Function),
+      remove: expect.any(Function),
       status: 'loading',
       updatedAt: expect.any(Number),
     })
@@ -96,16 +98,61 @@ describe('useInfiniteQuery', () => {
       isFetchingMore: false,
       isError: false,
       isFetched: true,
+      isFetchedAfterMount: true,
       isFetching: false,
       isIdle: false,
+      isInitialData: false,
       isLoading: false,
+      isPreviousData: false,
       isStale: true,
       isSuccess: true,
-      query: expect.any(Object),
       refetch: expect.any(Function),
+      remove: expect.any(Function),
       status: 'success',
       updatedAt: expect.any(Number),
     })
+  })
+
+  it('should not throw when fetchMore returns an error', async () => {
+    const consoleMock = mockConsoleError()
+    const key = queryKey()
+    let noThrow: boolean
+
+    function Page() {
+      const start = 1
+      const state = useInfiniteQuery(
+        key,
+        async (_key, page: number = start) => {
+          if (page === 2) {
+            throw new Error('error')
+          }
+          return page
+        },
+        {
+          retry: 1,
+          retryDelay: 10,
+          getFetchMore: (lastPage, _pages) => lastPage + 1,
+        }
+      )
+
+      const { fetchMore } = state
+
+      React.useEffect(() => {
+        setTimeout(async () => {
+          try {
+            await fetchMore()
+            noThrow = true
+          } catch (error) {}
+        }, 20)
+      }, [fetchMore])
+
+      return null
+    }
+
+    render(<Page />)
+
+    await waitFor(() => expect(noThrow).toBe(true))
+    consoleMock.mockRestore()
   })
 
   it('should keep the previous data when keepPreviousData is set', async () => {
@@ -117,9 +164,9 @@ describe('useInfiniteQuery', () => {
 
       const state = useInfiniteQuery(
         [key, order],
-        async (_key, order, page = 0) => {
+        async (_key, orderArg, pageArg = 0) => {
           await sleep(10)
-          return `${page}-${order}`
+          return `${pageArg}-${orderArg}`
         },
         {
           getFetchMore: (_lastGroup, _allGroups) => 1,
@@ -152,36 +199,42 @@ describe('useInfiniteQuery', () => {
       isFetching: true,
       isFetchingMore: false,
       isSuccess: false,
+      isPreviousData: false,
     })
     expect(states[1]).toMatchObject({
       data: ['0-desc'],
       isFetching: false,
       isFetchingMore: false,
       isSuccess: true,
+      isPreviousData: false,
     })
     expect(states[2]).toMatchObject({
       data: ['0-desc'],
       isFetching: true,
       isFetchingMore: 'next',
       isSuccess: true,
+      isPreviousData: false,
     })
     expect(states[3]).toMatchObject({
       data: ['0-desc', '1-desc'],
       isFetching: false,
       isFetchingMore: false,
       isSuccess: true,
+      isPreviousData: false,
     })
     expect(states[4]).toMatchObject({
       data: ['0-desc', '1-desc'],
       isFetching: true,
       isFetchingMore: false,
       isSuccess: true,
+      isPreviousData: true,
     })
     expect(states[5]).toMatchObject({
       data: ['0-asc'],
       isFetching: false,
       isFetchingMore: false,
       isSuccess: true,
+      isPreviousData: false,
     })
   })
 
@@ -243,6 +296,131 @@ describe('useInfiniteQuery', () => {
     expect(states[3]).toMatchObject({
       canFetchMore: true,
       data: [9, 10],
+      isFetching: false,
+      isFetchingMore: false,
+      isSuccess: true,
+    })
+  })
+
+  it('should silently cancel any ongoing fetch when fetching more', async () => {
+    const key = queryKey()
+    const states: InfiniteQueryResult<number>[] = []
+
+    function Page() {
+      const start = 10
+      const state = useInfiniteQuery(
+        key,
+        async (_key, page: number = start) => {
+          await sleep(50)
+          return page
+        },
+        {
+          getFetchMore: (lastPage, _pages) => lastPage + 1,
+        }
+      )
+
+      states.push(state)
+
+      const { refetch, fetchMore } = state
+
+      React.useEffect(() => {
+        setTimeout(() => {
+          refetch()
+        }, 100)
+        setTimeout(() => {
+          fetchMore()
+        }, 110)
+      }, [fetchMore, refetch])
+
+      return null
+    }
+
+    render(<Page />)
+
+    await waitFor(() => expect(states.length).toBe(5))
+
+    expect(states[0]).toMatchObject({
+      canFetchMore: undefined,
+      data: undefined,
+      isFetching: true,
+      isFetchingMore: false,
+      isSuccess: false,
+    })
+    expect(states[1]).toMatchObject({
+      canFetchMore: true,
+      data: [10],
+      isFetching: false,
+      isFetchingMore: false,
+      isSuccess: true,
+    })
+    expect(states[2]).toMatchObject({
+      canFetchMore: true,
+      data: [10],
+      isFetching: true,
+      isFetchingMore: false,
+      isSuccess: true,
+    })
+    expect(states[3]).toMatchObject({
+      canFetchMore: true,
+      data: [10],
+      isFetching: true,
+      isFetchingMore: 'next',
+      isSuccess: true,
+    })
+    expect(states[4]).toMatchObject({
+      canFetchMore: true,
+      data: [10, 11],
+      isFetching: false,
+      isFetchingMore: false,
+      isSuccess: true,
+    })
+  })
+
+  it('should keep fetching first page when not loaded yet and triggering fetch more', async () => {
+    const key = queryKey()
+    const states: InfiniteQueryResult<number>[] = []
+
+    function Page() {
+      const start = 10
+      const state = useInfiniteQuery(
+        key,
+        async (_key, page: number = start) => {
+          await sleep(50)
+          return page
+        },
+        {
+          getFetchMore: (lastPage, _pages) => lastPage + 1,
+        }
+      )
+
+      states.push(state)
+
+      const { refetch, fetchMore } = state
+
+      React.useEffect(() => {
+        setTimeout(() => {
+          fetchMore()
+        }, 10)
+      }, [fetchMore, refetch])
+
+      return null
+    }
+
+    render(<Page />)
+
+    await waitForMs(100)
+
+    expect(states.length).toBe(2)
+    expect(states[0]).toMatchObject({
+      canFetchMore: undefined,
+      data: undefined,
+      isFetching: true,
+      isFetchingMore: false,
+      isSuccess: false,
+    })
+    expect(states[1]).toMatchObject({
+      canFetchMore: true,
+      data: [10],
       isFetching: false,
       isFetchingMore: false,
       isSuccess: true,
@@ -757,7 +935,7 @@ describe('useInfiniteQuery', () => {
     const items = genItems(15)
     const limit = 3
 
-    const fetchItems = async (cursor = 0, ts: number) => {
+    const fetchItemsWithLimit = async (cursor = 0, ts: number) => {
       await sleep(10)
       return {
         nextId: cursor + limit,
@@ -779,7 +957,8 @@ describe('useInfiniteQuery', () => {
         refetch,
       } = useInfiniteQuery<Result, Error, [string, number]>(
         key,
-        (_key, nextId = 0) => fetchItems(nextId, fetchCountRef.current++),
+        (_key, nextId = 0) =>
+          fetchItemsWithLimit(nextId, fetchCountRef.current++),
         {
           getFetchMore: (lastGroup, _allGroups) => lastGroup.nextId,
         }

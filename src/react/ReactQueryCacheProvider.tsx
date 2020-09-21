@@ -1,13 +1,12 @@
 import React from 'react'
 
 import {
+  QueryCache,
   queryCache as defaultQueryCache,
   queryCaches,
-  makeQueryCache,
 } from '../core'
-import { QueryCache } from '../core/queryCache'
 
-export const queryCacheContext = React.createContext(defaultQueryCache)
+const queryCacheContext = React.createContext(defaultQueryCache)
 
 export const useQueryCache = () => React.useContext(queryCacheContext)
 
@@ -20,7 +19,7 @@ export const ReactQueryCacheProvider: React.FC<ReactQueryCacheProviderProps> = (
   children,
 }) => {
   const resolvedQueryCache = React.useMemo(
-    () => queryCache || makeQueryCache(),
+    () => queryCache || new QueryCache(),
     [queryCache]
   )
 

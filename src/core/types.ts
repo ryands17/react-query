@@ -1,4 +1,4 @@
-import type { Query, FetchMoreOptions, RefetchOptions } from './query'
+import type { FetchMoreOptions, RefetchOptions } from './query'
 import type { QueryCache } from './queryCache'
 
 export type QueryKey =
@@ -35,11 +35,6 @@ export type QueryKeySerializerFunction = (
 
 export interface BaseQueryConfig<TResult, TError = unknown, TData = TResult> {
   /**
-   * Set this to `false` to disable automatic refetching when the query mounts or changes query keys.
-   * To refetch the query, use the `refetch` method returned from the `useQuery` instance.
-   */
-  enabled?: boolean | unknown
-  /**
    * If `false`, failed queries will not retry by default.
    * If `true`, failed queries will retry infinitely., failureCount: num
    * If set to an integer number, e.g. 3, failed queries will retry until the failed query count meets that number.
@@ -47,7 +42,6 @@ export interface BaseQueryConfig<TResult, TError = unknown, TData = TResult> {
    */
   retry?: boolean | number | ((failureCount: number, error: TError) => boolean)
   retryDelay?: number | ((retryAttempt: number) => number)
-  staleTime?: number
   cacheTime?: number
   isDataEqual?: (oldData: unknown, newData: unknown) => boolean
   queryFn?: QueryFunction<TData>
@@ -55,7 +49,6 @@ export interface BaseQueryConfig<TResult, TError = unknown, TData = TResult> {
   queryKeySerializerFn?: QueryKeySerializerFunction
   queryFnParamsFilter?: (args: ArrayQueryKey) => ArrayQueryKey
   initialData?: TResult | InitialDataFunction<TResult>
-  initialStale?: boolean | InitialStaleFunction
   infinite?: true
   /**
    * Set this to `false` to disable structural sharing between query results.
@@ -81,6 +74,17 @@ export interface QueryObserverConfig<
    */
   enabled?: boolean | unknown
   /**
+   * The time in milliseconds after data is considered stale.
+   * If set to `Infinity`, the data will never be stale.
+   */
+  staleTime?: number
+  /**
+   * If set, this will mark any `initialData` provided as stale and will likely cause it to be refetched on mount.
+   * If a function is passed, it will be called only when appropriate to resolve the `initialStale` value.
+   * This can be useful if your `initialStale` value is costly to calculate.
+   */
+  initialStale?: boolean | InitialStaleFunction
+  /**
    * If set to a number, the query will continuously refetch at this frequency in milliseconds.
    * Defaults to `false`.
    */
@@ -91,20 +95,37 @@ export interface QueryObserverConfig<
    */
   refetchIntervalInBackground?: boolean
   /**
-   * Set this to `true` or `false` to enable/disable automatic refetching on window focus for this query.
+   * If set to `true`, the query will refetch on window focus if the data is stale.
+   * If set to `false`, the query will not refetch on window focus.
+   * If set to `'always'`, the query will always refetch on window focus.
    * Defaults to `true`.
    */
-  refetchOnWindowFocus?: boolean
+  refetchOnWindowFocus?: boolean | 'always'
   /**
-   * Set this to `true` or `false` to enable/disable automatic refetching on reconnect for this query.
+   * If set to `true`, the query will refetch on reconnect if the data is stale.
+   * If set to `false`, the query will not refetch on reconnect.
+   * If set to `'always'`, the query will always refetch on reconnect.
    * Defaults to `true`.
    */
-  refetchOnReconnect?: boolean
+  refetchOnReconnect?: boolean | 'always'
   /**
+   * If set to `true`, the query will refetch on mount if the data is stale.
    * If set to `false`, will disable additional instances of a query to trigger background refetches.
+   * If set to `'always'`, the query will always refetch on mount.
    * Defaults to `true`.
    */
-  refetchOnMount?: boolean
+  refetchOnMount?: boolean | 'always'
+  /**
+   * Set this to `true` to always fetch when the component mounts (regardless of staleness).
+   * Defaults to `false`.
+   */
+  forceFetchOnMount?: boolean
+  /**
+   * Whether a change to the query status should re-render a component.
+   * If set to `false`, the component will only re-render when the actual `data` or `error` changes.
+   * Defaults to `true`.
+   */
+  notifyOnStatusChange?: boolean
   /**
    * This callback will fire any time the query successfully fetches new data.
    */
@@ -133,10 +154,6 @@ export interface QueryObserverConfig<
    * Defaults to `false`.
    */
   keepPreviousData?: boolean
-  /**
-   * By default the query cache from the context is used, but a different cache can be specified.
-   */
-  queryCache?: QueryCache
 }
 
 export interface QueryConfig<TResult, TError = unknown>
@@ -147,6 +164,17 @@ export interface PaginatedQueryConfig<TResult, TError = unknown>
 
 export interface InfiniteQueryConfig<TResult, TError = unknown>
   extends QueryObserverConfig<TResult[], TError, TResult> {}
+
+export interface ResolvedQueryConfig<TResult, TError = unknown>
+  extends QueryConfig<TResult, TError> {
+  cacheTime: number
+  queryCache: QueryCache
+  queryFn: QueryFunction<TResult>
+  queryHash: string
+  queryKey: ArrayQueryKey
+  queryKeySerializerFn: QueryKeySerializerFunction
+  staleTime: number
+}
 
 export type IsFetchingMoreValue = 'previous' | 'next' | false
 
@@ -169,14 +197,17 @@ export interface QueryResultBase<TResult, TError = unknown> {
   ) => Promise<TResult | undefined>
   isError: boolean
   isFetched: boolean
+  isFetchedAfterMount: boolean
   isFetching: boolean
   isFetchingMore?: IsFetchingMoreValue
   isIdle: boolean
+  isInitialData: boolean
   isLoading: boolean
+  isPreviousData: boolean
   isStale: boolean
   isSuccess: boolean
-  query: Query<TResult, TError>
   refetch: (options?: RefetchOptions) => Promise<TResult | undefined>
+  remove: () => void
   status: QueryStatus
   updatedAt: number
 }
@@ -199,18 +230,18 @@ export interface MutateConfig<
   TVariables = unknown,
   TSnapshot = unknown
 > {
-  onSuccess?: (data: TResult, variables: TVariables) => Promise<void> | void
+  onSuccess?: (data: TResult, variables: TVariables) => Promise<unknown> | void
   onError?: (
     error: TError,
     variables: TVariables,
     snapshotValue: TSnapshot
-  ) => Promise<void> | void
+  ) => Promise<unknown> | void
   onSettled?: (
     data: undefined | TResult,
     error: TError | null,
     variables: TVariables,
     snapshotValue?: TSnapshot
-  ) => Promise<void> | void
+  ) => Promise<unknown> | void
   throwOnError?: boolean
 }
 

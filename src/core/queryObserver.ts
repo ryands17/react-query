@@ -1,70 +1,101 @@
-import { getStatusProps, isServer, isDocumentVisible } from './utils'
-import type { QueryResult, QueryObserverConfig } from './types'
-import type {
-  Query,
-  QueryState,
-  Action,
-  FetchMoreOptions,
-  RefetchOptions,
-} from './query'
+import {
+  getStatusProps,
+  isDocumentVisible,
+  isServer,
+  isValidTimeout,
+  noop,
+} from './utils'
+import { notifyManager } from './notifyManager'
+import type { QueryConfig, QueryResult, ResolvedQueryConfig } from './types'
+import type { Query, Action, FetchMoreOptions, RefetchOptions } from './query'
+import { DEFAULT_CONFIG, isResolvedQueryConfig } from './config'
 
 export type UpdateListener<TResult, TError> = (
   result: QueryResult<TResult, TError>
 ) => void
 
+interface NotifyOptions {
+  globalListeners?: boolean
+  listener?: boolean
+  onError?: boolean
+  onSuccess?: boolean
+}
+
 export class QueryObserver<TResult, TError> {
-  config: QueryObserverConfig<TResult, TError>
+  config: ResolvedQueryConfig<TResult, TError>
 
   private currentQuery!: Query<TResult, TError>
   private currentResult!: QueryResult<TResult, TError>
-  private previousResult?: QueryResult<TResult, TError>
-  private updateListener?: UpdateListener<TResult, TError>
+  private previousQueryResult?: QueryResult<TResult, TError>
+  private listener?: UpdateListener<TResult, TError>
+  private isStale: boolean
+  private initialUpdateCount: number
+  private staleTimeoutId?: number
   private refetchIntervalId?: number
-  private started?: boolean
 
-  constructor(config: QueryObserverConfig<TResult, TError>) {
+  constructor(config: ResolvedQueryConfig<TResult, TError>) {
     this.config = config
+    this.isStale = true
+    this.initialUpdateCount = 0
 
     // Bind exposed methods
-    this.clear = this.clear.bind(this)
+    this.remove = this.remove.bind(this)
     this.refetch = this.refetch.bind(this)
     this.fetchMore = this.fetchMore.bind(this)
+    this.unsubscribe = this.unsubscribe.bind(this)
 
     // Subscribe to the query
     this.updateQuery()
   }
 
   subscribe(listener?: UpdateListener<TResult, TError>): () => void {
-    this.started = true
-    this.updateListener = listener
+    this.listener = listener || noop
     this.currentQuery.subscribeObserver(this)
-    this.optionalFetch()
-    this.updateRefetchInterval()
-    return this.unsubscribe.bind(this)
+
+    if (
+      this.config.enabled &&
+      (this.config.forceFetchOnMount || this.config.refetchOnMount === 'always')
+    ) {
+      this.fetch()
+    } else {
+      this.optionalFetch()
+    }
+
+    this.updateTimers()
+
+    return this.unsubscribe
   }
 
   unsubscribe(): void {
-    this.started = false
-    this.updateListener = undefined
-    this.clearRefetchInterval()
+    this.listener = undefined
+    this.clearTimers()
     this.currentQuery.unsubscribeObserver(this)
   }
 
-  updateConfig(config: QueryObserverConfig<TResult, TError>): void {
+  updateConfig(
+    config: QueryConfig<TResult, TError> | ResolvedQueryConfig<TResult, TError>
+  ): void {
     const prevConfig = this.config
-    this.config = config
+    const prevQuery = this.currentQuery
 
-    const updated = this.updateQuery()
+    this.config = isResolvedQueryConfig(config)
+      ? config
+      : this.config.queryCache.getResolvedQueryConfig(
+          this.config.queryKey,
+          config
+        )
 
-    // Take no further actions if the observer did not start yet
-    if (!this.started) {
+    this.updateQuery()
+
+    // Take no further actions if there is no subscriber
+    if (!this.listener) {
       return
     }
 
     // If we subscribed to a new query, optionally fetch and update refetch
-    if (updated) {
+    if (this.currentQuery !== prevQuery) {
       this.optionalFetch()
-      this.updateRefetchInterval()
+      this.updateTimers()
       return
     }
 
@@ -73,56 +104,97 @@ export class QueryObserver<TResult, TError> {
       this.optionalFetch()
     }
 
+    // Update stale interval if needed
+    if (
+      config.enabled !== prevConfig.enabled ||
+      config.staleTime !== prevConfig.staleTime
+    ) {
+      this.updateStaleTimeout()
+    }
+
     // Update refetch interval if needed
     if (
       config.enabled !== prevConfig.enabled ||
-      config.refetchInterval !== prevConfig.refetchInterval ||
-      config.refetchIntervalInBackground !==
-        prevConfig.refetchIntervalInBackground
+      config.refetchInterval !== prevConfig.refetchInterval
     ) {
       this.updateRefetchInterval()
     }
+  }
+
+  getCurrentQuery(): Query<TResult, TError> {
+    return this.currentQuery
   }
 
   getCurrentResult(): QueryResult<TResult, TError> {
     return this.currentResult
   }
 
+  /**
+   * @deprecated
+   */
   clear(): void {
-    return this.currentQuery.clear()
+    this.remove()
   }
 
-  async refetch(options?: RefetchOptions): Promise<TResult | undefined> {
-    this.currentQuery.updateConfig(this.config)
-    return this.currentQuery.refetch(options)
+  remove(): void {
+    this.currentQuery.remove()
   }
 
-  async fetchMore(
+  refetch(options?: RefetchOptions): Promise<TResult | undefined> {
+    return this.currentQuery.refetch(options, this.config)
+  }
+
+  fetchMore(
     fetchMoreVariable?: unknown,
     options?: FetchMoreOptions
   ): Promise<TResult | undefined> {
-    this.currentQuery.updateConfig(this.config)
-    return this.currentQuery.fetchMore(fetchMoreVariable, options)
+    return this.currentQuery
+      .fetchMore(fetchMoreVariable, options, this.config)
+      .catch(noop)
   }
 
-  async fetch(): Promise<TResult | undefined> {
-    this.currentQuery.updateConfig(this.config)
-    try {
-      return await this.currentQuery.fetch()
-    } catch (error) {
-      return undefined
+  fetch(): Promise<TResult | undefined> {
+    // Never try to fetch if no query function has been set
+    if (this.config.queryFn === DEFAULT_CONFIG.queries?.queryFn) {
+      return Promise.resolve(this.currentResult.data)
     }
+
+    return this.currentQuery.fetch(undefined, this.config).catch(noop)
   }
 
   private optionalFetch(): void {
     if (
-      this.config.enabled && // Don't auto refetch if disabled
+      this.config.enabled && // Only fetch if enabled
+      this.isStale && // Only fetch if stale
       !(this.config.suspense && this.currentResult.isFetched) && // Don't refetch if in suspense mode and the data is already fetched
-      this.currentResult.isStale && // Only refetch if stale
       (this.config.refetchOnMount || this.currentQuery.observers.length === 1)
     ) {
       this.fetch()
     }
+  }
+
+  private updateStaleTimeout(): void {
+    if (isServer) {
+      return
+    }
+
+    this.clearStaleTimeout()
+
+    if (this.isStale || !isValidTimeout(this.config.staleTime)) {
+      return
+    }
+
+    const timeElapsed = Date.now() - this.currentResult.updatedAt
+    const timeUntilStale = this.config.staleTime - timeElapsed + 1
+    const timeout = Math.max(timeUntilStale, 0)
+
+    this.staleTimeoutId = setTimeout(() => {
+      if (!this.isStale) {
+        this.isStale = true
+        this.updateResult()
+        this.notify({ listener: true, globalListeners: true })
+      }
+    }, timeout)
   }
 
   private updateRefetchInterval(): void {
@@ -132,12 +204,7 @@ export class QueryObserver<TResult, TError> {
 
     this.clearRefetchInterval()
 
-    if (
-      !this.config.enabled ||
-      !this.config.refetchInterval ||
-      this.config.refetchInterval < 0 ||
-      this.config.refetchInterval === Infinity
-    ) {
+    if (!this.config.enabled || !isValidTimeout(this.config.refetchInterval)) {
       return
     }
 
@@ -148,101 +215,198 @@ export class QueryObserver<TResult, TError> {
     }, this.config.refetchInterval)
   }
 
-  clearRefetchInterval(): void {
+  updateTimers(): void {
+    this.updateStaleTimeout()
+    this.updateRefetchInterval()
+  }
+
+  clearTimers(): void {
+    this.clearStaleTimeout()
+    this.clearRefetchInterval()
+  }
+
+  private clearStaleTimeout(): void {
+    if (this.staleTimeoutId) {
+      clearInterval(this.staleTimeoutId)
+      this.staleTimeoutId = undefined
+    }
+  }
+
+  private clearRefetchInterval(): void {
     if (this.refetchIntervalId) {
       clearInterval(this.refetchIntervalId)
       this.refetchIntervalId = undefined
     }
   }
 
-  private createResult(): QueryResult<TResult, TError> {
-    const { currentQuery, previousResult, config } = this
-
-    const {
-      canFetchMore,
-      error,
-      failureCount,
-      isFetched,
-      isFetching,
-      isFetchingMore,
-      isLoading,
-      isStale,
-    } = currentQuery.state
-
-    let { data, status, updatedAt } = currentQuery.state
+  private updateResult(): void {
+    const { state } = this.currentQuery
+    let { data, status, updatedAt } = state
+    let isPreviousData = false
 
     // Keep previous data if needed
-    if (config.keepPreviousData && isLoading && previousResult?.isSuccess) {
-      data = previousResult.data
-      updatedAt = previousResult.updatedAt
-      status = previousResult.status
+    if (
+      this.config.keepPreviousData &&
+      state.isInitialData &&
+      this.previousQueryResult?.isSuccess
+    ) {
+      data = this.previousQueryResult.data
+      updatedAt = this.previousQueryResult.updatedAt
+      status = this.previousQueryResult.status
+      isPreviousData = true
     }
 
-    return {
+    this.currentResult = {
       ...getStatusProps(status),
-      canFetchMore,
-      clear: this.clear,
+      canFetchMore: state.canFetchMore,
+      clear: this.remove,
       data,
-      error,
-      failureCount,
+      error: state.error,
+      failureCount: state.failureCount,
       fetchMore: this.fetchMore,
-      isFetched,
-      isFetching,
-      isFetchingMore,
-      isStale,
-      query: currentQuery,
+      isFetched: state.updateCount > 0,
+      isFetchedAfterMount: state.updateCount > this.initialUpdateCount,
+      isFetching: state.isFetching,
+      isFetchingMore: state.isFetchingMore,
+      isInitialData: state.isInitialData,
+      isPreviousData,
+      isStale: this.isStale,
       refetch: this.refetch,
+      remove: this.remove,
       updatedAt,
     }
   }
 
-  private updateQuery(): boolean {
+  private updateQuery(): void {
+    const config = this.config
     const prevQuery = this.currentQuery
 
-    // Remove the initial data when there is an existing query
-    // because this data should not be used for a new query
-    const config = prevQuery
-      ? { ...this.config, initialData: undefined }
-      : this.config
+    let query = config.queryCache.getQueryByHash<TResult, TError>(
+      config.queryHash
+    )
 
-    const newQuery = config.queryCache!.buildQuery(config.queryKey, config)
-
-    if (newQuery === prevQuery) {
-      return false
+    if (!query) {
+      query = config.queryCache.createQuery(config)
     }
 
-    newQuery.activateTimeouts()
+    if (query === prevQuery) {
+      return
+    }
 
-    this.previousResult = this.currentResult
-    this.currentQuery = newQuery
-    this.currentResult = this.createResult()
+    this.previousQueryResult = this.currentResult
+    this.currentQuery = query
+    this.initialUpdateCount = query.state.updateCount
 
-    if (this.started) {
+    // Update stale state on query switch
+    if (query.state.isInitialData) {
+      if (config.keepPreviousData && prevQuery) {
+        this.isStale = true
+      } else if (typeof config.initialStale === 'function') {
+        this.isStale = config.initialStale()
+      } else if (typeof config.initialStale === 'boolean') {
+        this.isStale = config.initialStale
+      } else {
+        this.isStale = typeof query.state.data === 'undefined'
+      }
+    } else {
+      this.isStale = query.isStaleByTime(config.staleTime)
+    }
+
+    this.updateResult()
+
+    if (this.listener) {
       prevQuery?.unsubscribeObserver(this)
       this.currentQuery.subscribeObserver(this)
     }
-
-    return true
   }
 
-  onQueryUpdate(
-    _state: QueryState<TResult, TError>,
-    action: Action<TResult, TError>
-  ): void {
-    this.currentResult = this.createResult()
+  onQueryUpdate(action: Action<TResult, TError>): void {
+    const { config } = this
+    const { type } = action
 
-    const { data, error, isSuccess, isError } = this.currentResult
-
-    if (action.type === 'Success' && isSuccess) {
-      this.config.onSuccess?.(data!)
-      this.config.onSettled?.(data!, null)
-      this.updateRefetchInterval()
-    } else if (action.type === 'Error' && isError) {
-      this.config.onError?.(error!)
-      this.config.onSettled?.(undefined, error!)
-      this.updateRefetchInterval()
+    // Update stale state on success, error or invalidation
+    if (type === 2 || type === 3 || type === 4) {
+      this.isStale = this.currentQuery.isStaleByTime(config.staleTime)
     }
 
-    this.updateListener?.(this.currentResult)
+    // Store current result and get new result
+    const prevResult = this.currentResult
+    this.updateResult()
+    const currentResult = this.currentResult
+
+    // Update timers on success, error or invalidation
+    if (type === 2 || type === 3 || type === 4) {
+      this.updateTimers()
+    }
+
+    // Do not notify if the query was invalidated but the stale state did not changed
+    if (type === 4 && currentResult.isStale === prevResult.isStale) {
+      return
+    }
+
+    // Determine which callbacks to trigger
+    const notifyOptions: NotifyOptions = {}
+
+    if (type === 2) {
+      notifyOptions.onSuccess = true
+    } else if (type === 3) {
+      notifyOptions.onError = true
+    }
+
+    if (
+      // Always notify if notifyOnStatusChange is set
+      config.notifyOnStatusChange ||
+      // Otherwise only notify on data or error change
+      currentResult.data !== prevResult.data ||
+      currentResult.error !== prevResult.error
+    ) {
+      notifyOptions.listener = true
+    }
+
+    this.notify(notifyOptions)
+  }
+
+  private notify(options: NotifyOptions): void {
+    const { config, currentResult, currentQuery, listener } = this
+    const { onSuccess, onSettled, onError } = config
+
+    notifyManager.batch(() => {
+      // First trigger the configuration callbacks
+      if (options.onSuccess) {
+        if (onSuccess) {
+          notifyManager.schedule(() => {
+            onSuccess(currentResult.data!)
+          })
+        }
+        if (onSettled) {
+          notifyManager.schedule(() => {
+            onSettled(currentResult.data!, null)
+          })
+        }
+      } else if (options.onError) {
+        if (onError) {
+          notifyManager.schedule(() => {
+            onError(currentResult.error!)
+          })
+        }
+        if (onSettled) {
+          notifyManager.schedule(() => {
+            onSettled(undefined, currentResult.error!)
+          })
+        }
+      }
+
+      // Then trigger the listener
+      if (options.listener && listener) {
+        notifyManager.schedule(() => {
+          listener(currentResult)
+        })
+      }
+
+      // Then the global listeners
+      if (options.globalListeners) {
+        config.queryCache.notifyGlobalListeners(currentQuery)
+      }
+    })
   }
 }

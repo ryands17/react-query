@@ -2,8 +2,7 @@ import { render, fireEvent, waitFor } from '@testing-library/react'
 import * as React from 'react'
 
 import { sleep, queryKey } from './utils'
-import { usePaginatedQuery } from '..'
-import { PaginatedQueryResult } from '../../core'
+import { usePaginatedQuery, PaginatedQueryResult } from '../..'
 
 describe('usePaginatedQuery', () => {
   it('should return the correct states for a successful query', async () => {
@@ -11,13 +10,10 @@ describe('usePaginatedQuery', () => {
     const states: PaginatedQueryResult<number>[] = []
 
     function Page() {
-      const state = usePaginatedQuery(
-        [key, 1],
-        async (_queryName, page: number) => {
-          await sleep(10)
-          return page
-        }
-      )
+      const state = usePaginatedQuery([key, 1], async (_, page: number) => {
+        await sleep(10)
+        return page
+      })
 
       states.push(state)
 
@@ -41,16 +37,19 @@ describe('usePaginatedQuery', () => {
       fetchMore: expect.any(Function),
       isError: false,
       isFetched: false,
+      isFetchedAfterMount: false,
       isFetching: true,
       isFetchingMore: false,
       isIdle: false,
+      isInitialData: true,
       isLoading: true,
+      isPreviousData: false,
       isStale: true,
       isSuccess: false,
-      query: expect.any(Object),
       latestData: undefined,
       resolvedData: undefined,
       refetch: expect.any(Function),
+      remove: expect.any(Function),
       status: 'loading',
       updatedAt: expect.any(Number),
     })
@@ -64,16 +63,19 @@ describe('usePaginatedQuery', () => {
       fetchMore: expect.any(Function),
       isError: false,
       isFetched: true,
+      isFetchedAfterMount: true,
       isFetching: false,
       isFetchingMore: false,
       isIdle: false,
+      isInitialData: false,
       isLoading: false,
+      isPreviousData: false,
       isStale: true,
       isSuccess: true,
-      query: expect.any(Object),
       latestData: 1,
       resolvedData: 1,
       refetch: expect.any(Function),
+      remove: expect.any(Function),
       status: 'success',
       updatedAt: expect.any(Number),
     })
@@ -86,9 +88,9 @@ describe('usePaginatedQuery', () => {
       const [page, setPage] = React.useState(1)
       const { resolvedData = 'undefined' } = usePaginatedQuery(
         [key, page],
-        async (_queryName: string, page: number) => {
+        async (_: string, pageArg: number) => {
           await sleep(10)
-          return page
+          return pageArg
         }
       )
 
@@ -123,9 +125,9 @@ describe('usePaginatedQuery', () => {
 
       const { resolvedData } = usePaginatedQuery(
         [key, params],
-        async (_queryName: string, { page }: typeof params) => {
+        async (_: string, paramsArg: typeof params) => {
           await sleep(10)
-          return page
+          return paramsArg.page
         },
         { initialData: 0 }
       )
@@ -165,9 +167,9 @@ describe('usePaginatedQuery', () => {
 
       const { resolvedData, status } = usePaginatedQuery(
         [key, params],
-        async (_queryName: string, { page }: typeof params) => {
+        async (_: string, paramsArg: typeof params) => {
           await sleep(10)
-          return page
+          return paramsArg.page
         },
         { initialData: 0 }
       )
@@ -202,12 +204,13 @@ describe('usePaginatedQuery', () => {
       const [page, setPage] = React.useState(1)
       const { resolvedData = 'undefined' } = usePaginatedQuery(
         [key, searchTerm, page],
-        async (_queryName: string, searchTerm: string, page: number) => {
+        async (_: string, searchTermArg: string, pageArg: number) => {
           await sleep(10)
-          return `${searchTerm} ${page}`
+          return `${searchTermArg} ${pageArg}`
         },
         {
           enabled: searchTerm,
+          keepPreviousData: page !== 1,
         }
       )
 
@@ -268,9 +271,9 @@ describe('usePaginatedQuery', () => {
 
       const { resolvedData } = usePaginatedQuery(
         [key, params],
-        async (_queryName: string, { page }: typeof params) => {
+        async (_: string, paramsArg: typeof params) => {
           await sleep(10)
-          return page
+          return paramsArg.page
         },
         {
           initialData: 0,

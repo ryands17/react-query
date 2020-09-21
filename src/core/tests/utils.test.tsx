@@ -1,5 +1,5 @@
-import { deepEqual, replaceEqualDeep } from '../utils'
-import { setConsole, queryCache } from '..'
+import { replaceEqualDeep, deepIncludes, isPlainObject } from '../utils'
+import { setConsole, queryCache } from '../..'
 import { queryKey } from '../../react/tests/utils'
 
 describe('core/utils', () => {
@@ -29,23 +29,35 @@ describe('core/utils', () => {
     setConsole(console)
   })
 
-  describe('deepEqual', () => {
-    it('should return `true` for equal objects', () => {
+  describe('isPlainObject', () => {
+    it('should return `true` for a plain object', () => {
+      expect(isPlainObject({})).toEqual(true)
+    })
+
+    it('should return `false` for an array', () => {
+      expect(isPlainObject([])).toEqual(false)
+    })
+
+    it('should return `false` for null', () => {
+      expect(isPlainObject(null)).toEqual(false)
+    })
+
+    it('should return `false` for undefined', () => {
+      expect(isPlainObject(undefined)).toEqual(false)
+    })
+  })
+
+  describe('deepIncludes', () => {
+    it('should return `true` if a includes b', () => {
       const a = { a: { b: 'b' }, c: 'c', d: [{ d: 'd ' }] }
+      const b = { a: { b: 'b' }, c: 'c', d: [] }
+      expect(deepIncludes(a, b)).toEqual(true)
+    })
+
+    it('should return `false` if a does not include b', () => {
+      const a = { a: { b: 'b' }, c: 'c', d: [] }
       const b = { a: { b: 'b' }, c: 'c', d: [{ d: 'd ' }] }
-      expect(deepEqual(a, b)).toEqual(true)
-    })
-
-    it('should return `false` for non equal objects', () => {
-      const a = { a: { b: 'b' }, c: 'c' }
-      const b = { a: { b: 'c' }, c: 'c' }
-      expect(deepEqual(a, b)).toEqual(false)
-    })
-
-    it('return `false` for equal dates', () => {
-      const date1 = new Date(2020, 3, 1)
-      const date2 = new Date(2020, 3, 1)
-      expect(deepEqual(date1, date2)).toEqual(false)
+      expect(deepIncludes(a, b)).toEqual(false)
     })
   })
 

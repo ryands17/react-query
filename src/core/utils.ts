@@ -20,17 +20,24 @@ interface Cancelable {
   cancel(): void
 }
 
-export class CancelledError {}
+export class CancelledError {
+  silent?: boolean
+  constructor(silent?: boolean) {
+    this.silent = silent
+  }
+}
 
 // UTILS
 
 let _uid = 0
-export const uid = () => _uid++
+export function uid(): number {
+  return _uid++
+}
 
 export const isServer = typeof window === 'undefined'
 
-function noop(): void {
-  return void 0
+export function noop(): undefined {
+  return undefined
 }
 
 export let Console: ConsoleObject = console || {
@@ -54,10 +61,10 @@ export function functionalUpdate<TInput, TOutput>(
 
 function stableStringifyReplacer(_key: string, value: any): unknown {
   if (typeof value === 'function') {
-    throw new Error('Cannot stringify non JSON value')
+    throw new Error()
   }
 
-  if (isObject(value)) {
+  if (isPlainObject(value)) {
     return Object.keys(value)
       .sort()
       .reduce((result, key) => {
@@ -89,6 +96,10 @@ export function deepIncludes(a: any, b: any): boolean {
   return false
 }
 
+export function isValidTimeout(value: any): value is number {
+  return typeof value === 'number' && value >= 0 && value !== Infinity
+}
+
 export function isDocumentVisible(): boolean {
   // document global can be unavailable in react native
   if (typeof document === 'undefined') {
@@ -102,40 +113,39 @@ export function isOnline(): boolean {
 }
 
 export function getQueryArgs<TResult, TError, TOptions = undefined>(
-  args: any[]
+  arg1: any,
+  arg2?: any,
+  arg3?: any,
+  arg4?: any
 ): [QueryKey, QueryConfig<TResult, TError>, TOptions] {
   let queryKey: QueryKey
   let queryFn: QueryFunction<TResult> | undefined
   let config: QueryConfig<TResult, TError> | undefined
   let options: TOptions
 
-  if (isObject(args[0])) {
-    queryKey = args[0].queryKey
-    queryFn = args[0].queryFn
-    config = args[0].config
-    options = args[1]
-  } else if (isObject(args[1])) {
-    queryKey = args[0]
-    config = args[1]
-    options = args[2]
+  if (isPlainObject(arg1)) {
+    queryKey = arg1.queryKey
+    queryFn = arg1.queryFn
+    config = arg1.config
+    options = arg2
+  } else if (isPlainObject(arg2)) {
+    queryKey = arg1
+    config = arg2
+    options = arg3
   } else {
-    queryKey = args[0]
-    queryFn = args[1]
-    config = args[2]
-    options = args[3]
+    queryKey = arg1
+    queryFn = arg2
+    config = arg3
+    options = arg4
   }
 
-  config = config ? { queryKey, ...config } : { queryKey }
+  config = config || {}
 
   if (queryFn) {
     config = { ...config, queryFn }
   }
 
   return [queryKey, config, options]
-}
-
-export function deepEqual(a: any, b: any): boolean {
-  return replaceEqualDeep(a, b) === a
 }
 
 /**
@@ -173,12 +183,8 @@ export function replaceEqualDeep(a: any, b: any): any {
   return b
 }
 
-export function isObject(a: unknown): boolean {
-  return a && typeof a === 'object' && !Array.isArray(a)
-}
-
 // Copied from: https://github.com/jonschlinkert/is-plain-object
-function isPlainObject(o: any): o is Object {
+export function isPlainObject(o: any): o is Object {
   if (!hasObjectPrototype(o)) {
     return false
   }
@@ -246,4 +252,35 @@ export function createSetHandler(fn: () => void) {
     // Sub the new handler
     removePreviousHandler = callback(fn)
   }
+}
+
+/**
+ * Schedules a microtask.
+ * This can be useful to schedule state updates after rendering.
+ */
+export function scheduleMicrotask(callback: () => void): void {
+  Promise.resolve()
+    .then(callback)
+    .catch(error =>
+      setTimeout(() => {
+        throw error
+      })
+    )
+}
+
+type BatchUpdateFunction = (callback: () => void) => void
+
+// Default to a dummy "batch" implementation that just runs the callback
+let batchedUpdates: BatchUpdateFunction = (callback: () => void) => {
+  callback()
+}
+
+// Allow injecting another batching function later
+export function setBatchedUpdates(fn: BatchUpdateFunction) {
+  batchedUpdates = fn
+}
+
+// Supply a getter just to skip dealing with ESM bindings
+export function getBatchedUpdates(): BatchUpdateFunction {
+  return batchedUpdates
 }
